@@ -114,6 +114,49 @@ struct gdb_state {
 
 /*****************************************************************************
  *
+ *  UVM32
+ *
+ ****************************************************************************/
+
+#ifdef GDBSTUB_ARCH_UVM32
+
+#include "uvm32.h"
+
+typedef uint32_t address;
+typedef uint32_t reg;
+typedef int32_t (*uvm32_event_callback_t)(uvm32_state_t* vmst, uvm32_evt_t *evt);
+
+typedef enum {
+    SIGNONE = 0,
+    SIGILL  = 4,
+    SIGTRAP = 5,
+    SIGSEGV = 11,
+} gdbstub_signal_t;
+
+enum GDB_REGISTER {
+  /* 32 registers and PC */
+  GDB_CPU_NUM_REGISTERS = (32 + 1),
+};
+
+struct gdb_state {
+  /* Not used, only for compatibility */
+  uint8_t signum;
+  /* UVM32 state */
+  uvm32_state_t* vmst;
+  /* User defined callback to handle events */
+  uvm32_event_callback_t event_cb;
+   /* Will be upated with `vmst->_core' registers */
+  reg registers[GDB_CPU_NUM_REGISTERS];
+};
+
+int32_t gdb_sys_init_state(struct gdb_state* state,
+                           uvm32_state_t* vmst,
+                           uvm32_event_callback_t event_cb);
+
+#endif /* GDBSTUB_ARCH_UVM32 */
+
+/*****************************************************************************
+ *
  *  GDB Remote Serial Protocol
  *
  ****************************************************************************/
@@ -933,7 +976,7 @@ static int gdb_read(struct gdb_state *state, char *buf, unsigned int buf_len,
 int gdb_main(struct gdb_state *state)
 {
     address addr;
-    char pkt_buf[256];
+    char pkt_buf[512];
     int status;
     unsigned int length;
     unsigned int pkt_len;
@@ -1654,5 +1697,191 @@ void gdb_sys_init(void)
 }
 
 #endif /* GDBSTUB_ARCH_X86 */
+
+/*****************************************************************************
+ *
+ *  UVM32
+ *
+ ****************************************************************************/
+
+#ifdef GDBSTUB_ARCH_UVM32
+
+#include <stdlib.h>
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+
+
+/*****************************************************************************
+ * Debugging System Functions
+ ****************************************************************************/
+
+/*
+ * Write one character to the debugging stream.
+ */
+int gdb_sys_putchar(struct gdb_state *state, int ch)
+{
+  if (EOF == fputc(ch, stdout)) return GDB_EOF;
+  fflush(stdout);
+  return 0;
+}
+
+/*
+ * Read one character from the debugging stream.
+ */
+int gdb_sys_getc(struct gdb_state *state)
+{
+  int ch = fgetc(stdin);
+  return (EOF == ch) ? GDB_EOF : ch;
+}
+
+/*
+ * Read one byte from memory.
+ */
+int gdb_sys_mem_readb(struct gdb_state *state, address addr, char *val)
+{
+  if (addr >= MINIRV32_RAM_IMAGE_OFFSET) {
+    addr -= MINIRV32_RAM_IMAGE_OFFSET;
+  }
+
+  if (addr >= UVM32_MEMORY_SIZE) {
+    return 1;
+  }
+
+  const uint8_t *mem = uvm32_getMemory(state->vmst);
+  *val = (char)mem[addr];
+  return 0;
+}
+
+/*
+ * Write one byte to memory.
+ */
+int gdb_sys_mem_writeb(struct gdb_state *state, address addr, char val)
+{
+  if (addr >= MINIRV32_RAM_IMAGE_OFFSET) {
+    addr -= MINIRV32_RAM_IMAGE_OFFSET;
+  }
+
+  if (addr >= UVM32_MEMORY_SIZE) {
+    return 1;
+  }
+
+  uint8_t *mem = (uint8_t *)uvm32_getMemory(state->vmst);
+  mem[addr] = (uint8_t)val;
+  return 0;
+}
+
+static int gdb_sys_run(struct gdb_state *state, bool cont) {
+  bool running = true;
+  enum {
+    MAX_STEPS = 1000
+  };
+
+  while (running) {
+    uvm32_evt_t evt = {0};
+    uint32_t steps = uvm32_run(state->vmst,
+                               &evt,
+                               cont ? MAX_STEPS : 1);
+
+    /* Call user callback if available */
+    if (NULL != state->event_cb) {
+      state->event_cb(state->vmst, &evt);
+    }
+
+    switch (evt.typ) {
+    case UVM32_EVT_BREAK:
+      running = false;
+      state->signum = SIGTRAP;
+      uvm32_clearError(state->vmst);
+      break;
+
+    case UVM32_EVT_ERR:
+      switch (evt.data.err.errcode) {
+      case UVM32_ERR_HUNG:
+        if (!cont) { // single step
+          state->signum = SIGTRAP;
+          uvm32_clearError(state->vmst);
+          running = false;
+        } else if (MAX_STEPS == steps) { // continue?
+          /* Ran up to max steps, keep going */
+          uvm32_clearError(state->vmst);
+        } else {
+          state->signum = SIGTRAP; // FIXME
+          running = false;
+        }
+        break;
+
+      case UVM32_ERR_MEM_RD:
+      case UVM32_ERR_MEM_WR:
+        running = false;
+        state->signum = SIGSEGV;
+        break;
+
+      case UVM32_ERR_INTERNAL_CORE:
+        running = false;
+        state->signum = SIGILL;
+        break;
+
+      default:
+        break;
+      } // switch(evt.data.err.errcode)
+      break;
+
+    default:
+      break;
+    } // switch(evt.typ)
+  } // while
+
+  /* Update registers */
+  memcpy(state->registers,
+         &state->vmst->_core.regs,
+         sizeof(state->registers));
+
+  return 0;
+}
+
+/*
+ * Continue program execution.
+ */
+int gdb_sys_continue(struct gdb_state *state) {
+  return gdb_sys_run(state, true);
+}
+
+/*
+ * Single step the next instruction.
+ */
+int gdb_sys_step(struct gdb_state *state) {
+  return gdb_sys_run(state, false);
+}
+
+/*
+ * Debugger init function.
+ *
+ */
+void gdb_sys_init(void)
+{
+
+}
+
+/* Helper function to init gdb_state */
+int32_t gdb_sys_init_state(struct gdb_state* state,
+                           uvm32_state_t* vmst,
+                           uvm32_event_callback_t event_cb) {
+  /* Sanity check argument */
+  if ((NULL == state) || (NULL == vmst)) {
+    return -1;
+  }
+  memset(state, 0, sizeof(struct gdb_state));
+  state->vmst = vmst;
+  state->event_cb = event_cb;
+  /* Update registers */
+  memcpy(state->registers,
+         vmst->_core.regs,
+         sizeof(state->registers));
+  return 0;
+}
+
+#endif /* GDBSTUB_ARCH_UVM32 */
 #endif /* GDBSTUB_IMPLEMENTATION */
 #endif /* GDBSTUB_H */
